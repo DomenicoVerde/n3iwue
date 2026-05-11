@@ -98,7 +98,7 @@ func GetPduSessionEstablishmentRequest(pduSessionId uint8) []byte {
 	pduSessionEstablishmentRequest.SetExtendedProtocolDiscriminator(
 		nasMessage.Epd5GSSessionManagementMessage)
 	pduSessionEstablishmentRequest.SetMessageType(nas.MsgTypePDUSessionEstablishmentRequest)
-  pduSessionEstablishmentRequest.SetPDUSessionID(pduSessionId)
+	pduSessionEstablishmentRequest.SetPDUSessionID(pduSessionId)
 
 	// UE shall use a PTI value in the range [1, 254], 0 means unassigned and 255 reserved (Ref. TS 24 007 11.2.3.1a)
 	pduSessionEstablishmentRequest.SetPTI(getNextPTI(&pti))
@@ -851,7 +851,7 @@ func GetStatus5GSM(pduSessionId uint8, cause uint8, pti uint8) []byte {
 	status5GSM.SetMessageType(nas.MsgTypeStatus5GSM)
 	status5GSM.SetPDUSessionID(pduSessionId)
 	status5GSM.SetPTI(pti)
-  status5GSM.SetCauseValue(cause)
+	status5GSM.SetCauseValue(cause)
 
 	m.Status5GSM = status5GSM
 

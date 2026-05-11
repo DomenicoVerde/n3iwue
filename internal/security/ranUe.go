@@ -1,8 +1,8 @@
 package security
 
 import (
-	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 
@@ -36,16 +36,6 @@ type RanUeContext struct {
 	SQNIndBitLen     uint8    // Number of index bits (2-16, default: 5)
 	SQNWrappingDelta uint64   // Maximum allowed sequence advancement (default: 2^28)
 	SQNArray         []uint64 // Array of highest SQN values per index
-}
-
-type Milenage struct {
-	res   []byte // RES (Expected Response)
-	ck    []byte // Cipher Key
-	ik    []byte // Integrity Key
-	ak    []byte // Anonymity Key
-	ak_r  []byte // Anonymity Key for re-synchronization (AK*)
-	mac_a []byte // Message Authentication Code A (MAC-A)
-	mac_s []byte // Message Authentication Code S (MAC-S for re-sync)
 }
 
 func CalculateIpv4HeaderChecksum(hdr *ipv4.Header) uint32 {
@@ -115,20 +105,22 @@ func (ue *RanUeContext) DeriveRESstarAndSetKey(
 		fatal.Fatalf("DecodeString error: %+v", err)
 	}
 
-	// Increment SQN as per original logic
-
-	// Use optimized milenage calculation
-	milenageResult, err := ue.calculateMilenage(sqn, rand, false)
+	k, opc, amf, err := ue.getCryptographicKeys()
 	if err != nil {
-		fatal.Fatalf("calculateMilenage error: %+v", err)
+		fatal.Fatalf("getCryptographicKeys error: %+v", err)
+	}
+
+	ik, ck, res, _, err := milenage.GenerateAKAParameters(opc, k, rand, sqn, amf)
+	if err != nil {
+		fatal.Fatalf("GenerateAKAParameters error: %+v", err)
 	}
 
 	// derive RES*
-	key := append(milenageResult.ck, milenageResult.ik...)
+	key := append(ck, ik...)
 	FC := ueauth.FC_FOR_RES_STAR_XRES_STAR_DERIVATION
 	P0 := []byte(snName)
 	P1 := rand
-	P2 := milenageResult.res
+	P2 := res
 
 	ue.DerivateKamf(key, snName, autn[:])
 	ue.DerivateAlgKey()
@@ -334,50 +326,6 @@ func (ue *RanUeContext) getCurrentSqn() []byte {
 	return uint64ToSqnBytes(ue.getSqnMs())
 }
 
-// calculateMilenage performs milenage computation
-// dummyAmf: if true, uses AMF=0x0000 for re-synchronization; if false, uses configured AMF
-func (ue *RanUeContext) calculateMilenage(sqn, rand []byte, dummyAmf bool) (*Milenage, error) {
-	// Get cryptographic keys
-	k, opc, configAmf, err := ue.getCryptographicKeys()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get cryptographic keys: %v", err)
-	}
-
-	// Choose AMF value based on dummyAmf flag
-	var amf []byte
-	if dummyAmf {
-		amf = []byte{0x00, 0x00} // For re-synchronization (TS 33.102)
-	} else {
-		amf = configAmf // Use configured AMF
-	}
-
-	// Allocate result buffers
-	result := &Milenage{
-		res:   make([]byte, 8),
-		ck:    make([]byte, 16),
-		ik:    make([]byte, 16),
-		ak:    make([]byte, 6),
-		ak_r:  make([]byte, 6),
-		mac_a: make([]byte, 8),
-		mac_s: make([]byte, 8),
-	}
-
-	// Generate MAC_A and MAC_S using F1
-	err = milenage.F1(opc, k, rand, sqn, amf, result.mac_a, result.mac_s)
-	if err != nil {
-		return nil, fmt.Errorf("F1 computation failed: %v", err)
-	}
-
-	// Generate RES, CK, IK, AK, AK* using F2345
-	err = milenage.F2345(opc, k, rand, result.res, result.ck, result.ik,
-		result.ak, result.ak_r)
-	if err != nil {
-		return nil, fmt.Errorf("F2345 computation failed: %v", err)
-	}
-
-	return result, nil
-}
-
 // getCryptographicKeys extracts K, OPc, and AMF from the authentication subscription
 func (ue *RanUeContext) getCryptographicKeys() (k, opc, amf []byte, err error) {
 	// Decode permanent key (K)
@@ -405,7 +353,7 @@ func (ue *RanUeContext) getCryptographicKeys() (k, opc, amf []byte, err error) {
 			return nil, nil, nil, fmt.Errorf("failed to decode OP: %v", err)
 		}
 
-		opc, err = milenage.GenerateOPC(k, op)
+		opc, err = milenage.GenerateOPc(k, op)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to generate OPC: %v", err)
 		}
@@ -418,49 +366,34 @@ func (ue *RanUeContext) getCryptographicKeys() (k, opc, amf []byte, err error) {
 // Returns: (authResult, error)
 func (ue *RanUeContext) VerifyAUTN(autn, rand []byte) (int, error) {
 	nasLog := logger.NasLog
+	k, opc, _, err := ue.getCryptographicKeys()
+	if err != nil {
+		return AuthParameterError, fmt.Errorf("failed to get cryptographic keys: %v", err)
+	}
+
 	// Input validation
 	if len(autn) != 16 || len(rand) != 16 {
 		return AuthParameterError,
 			fmt.Errorf("invalid parameter length: AUTN=%d, RAND=%d", len(autn), len(rand))
 	}
 
-	// Extract AUTN components: (SQN⊕AK) || AMF || MAC-A
-	receivedSQNxorAK := autn[:6] // First 6 bytes
-	receivedMAC := autn[8:16]    // Last 8 bytes
-
-	// Use direct F2345 to calculate AK for SQN recovery
-	currentSQN := ue.getCurrentSqn()
-	milenageResult, err := ue.calculateMilenage(currentSQN, rand, false)
+	// nolint:dogsled
+	sqn, _, _, _, _, err := milenage.GenerateKeysWithAUTN(opc, k, rand, autn)
 	if err != nil {
-		return AuthParameterError,
-			fmt.Errorf("failed to calculate milenage for AUTS: %v", err)
-	}
-
-	// Recover actual SQN = (SQN⊕AK) ⊕ AK
-	receivedSQN := make([]byte, 6)
-	for i := 0; i < 6; i++ {
-		receivedSQN[i] = receivedSQNxorAK[i] ^ milenageResult.ak[i]
-	}
-
-	// Now verify MAC-A with the recovered SQN
-	milenageResult, err = ue.calculateMilenage(receivedSQN, rand, false)
-	if err != nil {
-		return AuthParameterError,
-			fmt.Errorf("failed to calculate milenage for AUTS: %v", err)
-	}
-
-	if !bytes.Equal(milenageResult.mac_a, receivedMAC) {
-		return MACFailure,
-			fmt.Errorf("MAC-A verification failed")
+		var macErr *milenage.MACFailureError
+		if errors.As(err, &macErr) {
+			return MACFailure, fmt.Errorf("MAC-A verification failed")
+		}
+		return AuthParameterError, fmt.Errorf("failed to validate AUTN: %v", err)
 	}
 
 	// Check SQN after MAC verification
-	if err := ue.checkSqn(sqnBytesToUint64(receivedSQN)); err != nil {
+	if err := ue.checkSqn(sqnBytesToUint64(sqn)); err != nil {
 		return SQNOutOfSync,
 			fmt.Errorf("failed to check SQN: %v", err)
 	}
 
-	nasLog.Infof("Extracted SQN from AUTN: %x", receivedSQN)
+	nasLog.Infof("Extracted SQN from AUTN: %x", sqn)
 
 	return AuthSuccess, nil
 }
@@ -508,24 +441,16 @@ func (ue *RanUeContext) GenerateAUTS(rand []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid RAND length: %d", len(rand))
 	}
 
-	currentSQN := ue.getCurrentSqn()
-
-	// Calculate milenage with dummy AMF for re-synchronization
-	milenageResult, err := ue.calculateMilenage(currentSQN, rand, true)
+	k, opc, _, err := ue.getCryptographicKeys()
 	if err != nil {
-		return nil, fmt.Errorf("failed to calculate milenage for AUTS: %v", err)
+		return nil, fmt.Errorf("failed to get cryptographic keys: %v", err)
 	}
 
-	// Construct AUTS = (SQN_MS ⊕ AK*) || MAC-S
-	auts := make([]byte, 14) // 6 + 8 bytes
-
-	// First 6 bytes: SQN_MS ⊕ AK*
-	for i := 0; i < 6; i++ {
-		auts[i] = currentSQN[i] ^ milenageResult.ak_r[i]
+	currentSQN := ue.getCurrentSqn()
+	auts, err := milenage.GenerateAUTS(opc, k, rand, currentSQN)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate AUTS: %v", err)
 	}
-
-	// Last 8 bytes: MAC-S
-	copy(auts[6:], milenageResult.mac_s)
 
 	return auts, nil
 }
